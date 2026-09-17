@@ -1,0 +1,14 @@
+{
+  "name": "datapulse",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DataPulse — Data Analytics & Business Intelligence Dashboard platform",
+  "scripts": {
+    "setup": "npm --prefix client install",
+    "dev": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "test": "npm --prefix client test -- --run",
+    "supabase:types": "supabase gen types typescript --local > client/src/lib/database.types.ts",
+    "supabase:push": "supabase db push"
+  }
+}

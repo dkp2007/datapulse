@@ -1,0 +1,220 @@
+
+
+create type public.widget_agg as enum ('sum', 'avg', 'count', 'count_distinct', 'min', 'max');
+
+create or replace function public.run_widget_query(
+  p_dataset_id uuid,
+  p_spec jsonb
+)
+returns jsonb
+language plpgsql
+stable
+as $$
+declare
+  v_owner uuid;
+  v_kind text;
+  v_where text := 'where dataset_id = $1';
+  v_dim text;
+  v_dim_type text;
+  v_grain text;
+  v_dim_expr text;
+  v_measure jsonb;
+  v_agg text;
+  v_field text;
+  v_expr text;
+  v_select_items text := '';
+  v_limit int;
+  v_filters jsonb;
+  v_f jsonb;
+  v_op text;
+  v_ftype text;
+  v_val text;
+  v_from text;
+  v_to text;
+  v_span interval;
+  v_prev_where text := '';
+  v_sql text;
+  v_value numeric;
+  v_prev numeric;
+  v_rec record;
+  v_values jsonb;
+  v_rows jsonb;
+  v_num_meas int;
+  j int;
+begin
+  select owner_id into v_owner from public.datasets where id = p_dataset_id;
+  if v_owner is null or v_owner <> auth.uid() then
+    raise exception 'Dataset not found or not owned by you';
+  end if;
+
+  v_kind := coalesce(p_spec ->> 'kind', 'series');
+  v_filters := coalesce(p_spec -> 'filters', '[]'::jsonb);
+
+  if jsonb_typeof(v_filters) = 'array' then
+    for i in 0 .. jsonb_array_length(v_filters) - 1 loop
+      v_f := v_filters -> i;
+      v_op := v_f ->> 'op';
+      v_val := v_f ->> 'value';
+      if v_op not in ('=', '!=', '>', '>=', '<', '<=', 'contains') then
+        raise exception 'Unsupported filter op: %', v_op;
+      end if;
+      if v_op = 'contains' then
+        v_where := v_where || format(' and (data ->> %L) ilike %L',
+          v_f ->> 'field', '%' || v_val || '%');
+      else
+        v_ftype := coalesce(v_f ->> 'type', 'text');
+        if v_ftype = 'number' then
+          v_where := v_where || format(' and (data ->> %L)::numeric %s %L',
+            v_f ->> 'field', v_op, v_val::numeric);
+        elsif v_ftype = 'date' then
+          v_where := v_where || format(' and (data ->> %L)::timestamptz %s %L',
+            v_f ->> 'field', v_op, v_val::timestamptz);
+        else
+          v_where := v_where || format(' and (data ->> %L) %s %L',
+            v_f ->> 'field', v_op, v_val);
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  if v_kind = 'scalar' then
+    v_measure := p_spec -> 'measure';
+    v_agg := v_measure ->> 'agg';
+    v_field := v_measure ->> 'field';
+    if v_agg not in ('sum', 'avg', 'count', 'count_distinct', 'min', 'max') then
+      raise exception 'Unsupported aggregate: %', v_agg;
+    end if;
+    if v_agg = 'count' then
+      v_expr := 'count(*)::numeric';
+    elsif v_agg = 'count_distinct' then
+      v_expr := format('count(distinct data ->> %L)::numeric', v_field);
+    else
+      v_expr := format('%s((data ->> %L)::numeric)', upper(v_agg), v_field);
+    end if;
+
+    v_sql := format('select coalesce(%s, 0) from public.dataset_rows %s', v_expr, v_where);
+    execute v_sql into v_value using p_dataset_id;
+
+    v_from := p_spec ->> 'dateFrom';
+    v_to := p_spec ->> 'dateTo';
+    if coalesce((p_spec ->> 'comparePrev')::boolean, false)
+       and v_from is not null and v_to is not null and (p_spec ->> 'dateField') is not null then
+      v_span := v_to::timestamptz - v_from::timestamptz;
+      v_prev_where := format(
+        ' and (data ->> %L)::timestamptz >= %L and (data ->> %L)::timestamptz < %L',
+        p_spec ->> 'dateField', v_from::timestamptz - v_span, p_spec ->> 'dateField', v_from::timestamptz);
+      execute format('select coalesce(%s, 0) from public.dataset_rows %s%s',
+        v_expr, v_where, v_prev_where) into v_prev using p_dataset_id;
+    end if;
+
+    return jsonb_build_object(
+      'kind', 'scalar',
+      'value', v_value,
+      'prev', v_prev,
+      'deltaPct', case
+        when v_prev is null or v_prev = 0 then null
+        else round((v_value - v_prev) / abs(v_prev) * 100, 1)
+      end,
+      'ranAt', now()
+    );
+  end if;
+
+  v_dim := p_spec ->> 'dimension';
+  v_dim_type := coalesce(p_spec ->> 'dimensionType', 'text');
+  v_grain := coalesce(p_spec ->> 'dateGrain', 'month');
+  v_limit := least(coalesce((p_spec ->> 'limit')::int, 100), 500);
+
+  if v_dim is null then
+    raise exception 'Series query requires a dimension';
+  end if;
+
+  if v_dim_type = 'date' then
+    if v_grain = 'day' then
+      v_dim_expr := format('to_char((data ->> %L)::timestamptz, ''YYYY-MM-DD'')', v_dim);
+    elsif v_grain = 'week' then
+      v_dim_expr := format('to_char(date_trunc(''week'', (data ->> %L)::timestamptz), ''IYYY"-W"IW'')', v_dim);
+    elsif v_grain = 'quarter' then
+      v_dim_expr := format('to_char(date_trunc(''quarter'', (data ->> %L)::timestamptz), ''YYYY"-Q"Q'')', v_dim);
+    elsif v_grain = 'year' then
+      v_dim_expr := format('to_char(date_trunc(''year'', (data ->> %L)::timestamptz), ''YYYY'')', v_dim);
+    else -- month (default)
+      v_dim_expr := format('to_char(date_trunc(''month'', (data ->> %L)::timestamptz), ''YYYY-MM'')', v_dim);
+    end if;
+  elsif v_dim_type = 'number' then
+    v_dim_expr := format('(data ->> %L)::numeric::text', v_dim);
+  else
+    v_dim_expr := format('coalesce(nullif(data ->> %L, ''''), ''(blank)'')', v_dim);
+  end if;
+
+  if p_spec -> 'measures' is null or jsonb_typeof(p_spec -> 'measures') <> 'array'
+     or jsonb_array_length(p_spec -> 'measures') = 0 then
+    raise exception 'Series query requires at least one measure';
+  end if;
+
+  for i in 0 .. jsonb_array_length(p_spec -> 'measures') - 1 loop
+    v_measure := p_spec -> 'measures' -> i;
+    v_agg := v_measure ->> 'agg';
+    v_field := v_measure ->> 'field';
+    if v_agg not in ('sum', 'avg', 'count', 'count_distinct', 'min', 'max') then
+      raise exception 'Unsupported aggregate: %', v_agg;
+    end if;
+    if v_agg = 'count' then
+      v_expr := 'count(*)::numeric';
+    elsif v_agg = 'count_distinct' then
+      v_expr := format('count(distinct data ->> %L)::numeric', v_field);
+    else
+      v_expr := format('%s((data ->> %L)::numeric)', upper(v_agg), v_field);
+    end if;
+    v_select_items := v_select_items ||
+      case when v_select_items = '' then '' else ', ' end ||
+      format('%s as m%s', v_expr, i);
+  end loop;
+
+  v_sql := format(
+    'select %s as dimension, %s
+       from public.dataset_rows %s
+       group by 1
+       order by 1 asc
+       limit %s',
+    v_dim_expr, v_select_items, v_where, v_limit
+  );
+
+  v_num_meas := jsonb_array_length(p_spec -> 'measures');
+  v_rows := '[]'::jsonb;
+  for v_rec in execute v_sql using p_dataset_id loop
+    v_values := '[]'::jsonb;
+    for j in 0 .. v_num_meas - 1 loop
+      v_values := v_values || to_jsonb((to_jsonb(v_rec) ->> ('m' || j::text))::numeric);
+    end loop;
+    v_rows := v_rows || jsonb_build_object('dimension', v_rec.dimension, 'values', v_values);
+  end loop;
+
+  return jsonb_build_object(
+    'kind', 'series',
+    'dimension', v_dim,
+    'rows', v_rows,
+    'ranAt', now()
+  );
+end;
+$$;
+
+revoke execute on function public.run_widget_query(uuid, jsonb) from anon, public;
+grant execute on function public.run_widget_query(uuid, jsonb) to authenticated;
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.profiles (id, full_name)
+  values (new.id, coalesce(new.raw_user_meta_data ->> 'full_name', ''))
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();

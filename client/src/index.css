@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: #eef7fd;
+  --color-brand-100: #d9edfa;
+  --color-brand-200: #bcdcf5;
+  --color-brand-300: #8ec6ee;
+  --color-brand-400: #48b8e9;
+  --color-brand-500: #2e93dd;
+  --color-brand-600: #247cd1;
+  --color-brand-700: #1e6abc;
+  --color-brand-800: #174dbf;
+  --color-brand-900: #123f9e;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+.animate-float {
+  animation: float 5s ease-in-out infinite;
+}
+
+.animate-float-delayed {
+  animation: float 6.5s ease-in-out 1.2s infinite;
+}
+
+.animate-pop-in {
+  animation: pop-in 0.18s ease-out;
+}
+
+.animate-slide-up {
+  animation: slide-up 0.28s ease-out;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.15s ease-out;
+}
+
+body {
+  @apply bg-brand-50 text-slate-900 antialiased;
+}
+
+.react-grid-item.react-grid-placeholder {
+  @apply bg-brand-200 rounded-xl opacity-60;
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #invoice-print,
+  #invoice-print * {
+    visibility: visible;
+  }
+  #invoice-print {
+    position: absolute;
+    inset: 0;
+    padding: 0;
+  }
+}
+
+.hindi-text {
+  font-family: 'Noto Sans Devanagari', 'Nirmala UI', system-ui, sans-serif;
+}
